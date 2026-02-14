@@ -1,0 +1,2 @@
+dbt-core
+dbt-postgres==1.9.1
