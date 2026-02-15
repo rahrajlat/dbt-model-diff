@@ -219,6 +219,42 @@ def ctas_copy(conn, src_schema: str, src_ident: str, dst_schema: str, dst_ident:
         )
 
 
+def pct(n: int, d: int) -> float:
+    return 0.0 if d == 0 else (n / d) * 100.0
+
+
+def fetch_column_profile(conn, schema: str, table: str, cols: list[str]) -> dict[str, dict[str, int]]:
+    """
+    One query per table:
+    - null count
+    - distinct count
+    """
+    if not cols:
+        return {}
+
+    select_parts: list[str] = []
+    for c in cols:
+        qc = quote_ident(c)
+        select_parts.append(
+            f"sum(({qc} is null)::int) as {quote_ident(c + '__nulls')}")
+        select_parts.append(
+            f"count(distinct {qc}) as {quote_ident(c + '__distinct')}")
+
+    sql = f"select {', '.join(select_parts)} from {quote_ident(schema)}.{quote_ident(table)}"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+
+    out: dict[str, dict[str, int]] = {}
+    idx = 0
+    for c in cols:
+        nulls = int(row[idx])
+        distincts = int(row[idx + 1])
+        out[c] = {"nulls": nulls, "distinct": distincts}
+        idx += 2
+    return out
+
+
 # ---------------------------------------------------------------------
 # CLI (MODEL-first)
 # ---------------------------------------------------------------------
@@ -243,6 +279,10 @@ def main(
     sample: int = typer.Option(20, help="Sample changed keys to print"),
     keep_schemas: bool = typer.Option(
         False, help="Do not drop diff schema after run"),
+    col_stats: bool = typer.Option(
+        True, "--col-stats/--no-col-stats", help="Print null% + distinct/uniqueness% per column"),
+    max_cols: int = typer.Option(
+        50, "--max-cols", help="Limit number of columns profiled (ordered by HEAD column order)"),
 ):
     kcols = [k.strip() for k in keys.split(",") if k.strip()]
     if not kcols:
@@ -271,7 +311,7 @@ def main(
             f"keys={', '.join(kcols)}\n"
             f"diff_schema={diff_schema}\n"
             f"tables:\n  {base_table}\n  {head_table}",
-            title="dbt-model-diff (data) — Postgres v1 (Option 2, fixed)",
+            title="dbt-model-diff (data) — Postgres v1 (Option 2, fixed + col stats)",
         )
     )
 
@@ -286,7 +326,7 @@ def main(
     try:
         ensure_schema(conn, diff_schema)
 
-        # create worktrees
+        # worktrees
         git_worktree_add(repo_root, base, wt_base)
         git_worktree_add(repo_root, head, wt_head)
 
@@ -416,6 +456,50 @@ def main(
         if only_in_base:
             console.print(
                 "[yellow]Columns only in BASE:[/yellow] " + ", ".join(only_in_base))
+
+        # -------------------------
+        # Column profiling (nulls%, distinct, uniqueness%)
+        # -------------------------
+        if col_stats:
+            prof_cols = common_cols[: max_cols if max_cols >
+                                    0 else len(common_cols)]
+
+            base_prof = fetch_column_profile(
+                conn, diff_schema, base_table, prof_cols)
+            head_prof = fetch_column_profile(
+                conn, diff_schema, head_table, prof_cols)
+
+            prof_tbl = Table(
+                title=f"Column profile (first {len(prof_cols)} common columns)")
+            prof_tbl.add_column("Column")
+            prof_tbl.add_column("Base null %", justify="right")
+            prof_tbl.add_column("Head null %", justify="right")
+            prof_tbl.add_column("Base distinct", justify="right")
+            prof_tbl.add_column("Head distinct", justify="right")
+            prof_tbl.add_column("Base uniq %", justify="right")
+            prof_tbl.add_column("Head uniq %", justify="right")
+
+            for c in prof_cols:
+                b = base_prof.get(c, {"nulls": 0, "distinct": 0})
+                h = head_prof.get(c, {"nulls": 0, "distinct": 0})
+
+                b_null_pct = pct(b["nulls"], base_count)
+                h_null_pct = pct(h["nulls"], head_count)
+
+                b_uniq_pct = pct(b["distinct"], base_count)
+                h_uniq_pct = pct(h["distinct"], head_count)
+
+                prof_tbl.add_row(
+                    c,
+                    f"{b_null_pct:.1f}",
+                    f"{h_null_pct:.1f}",
+                    str(b["distinct"]),
+                    str(h["distinct"]),
+                    f"{b_uniq_pct:.1f}",
+                    f"{h_uniq_pct:.1f}",
+                )
+
+            console.print(prof_tbl)
 
         # sample changed keys
         if changed and sample > 0:
