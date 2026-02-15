@@ -2,12 +2,10 @@
 
 ```{=html}
 <p align="center">
-```
-`<img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" />`{=html}
-`<img src="https://img.shields.io/badge/dbt-compatible-orange.svg" />`{=html}
-`<img src="https://img.shields.io/badge/license-MIT-green.svg" />`{=html}
-`<img src="https://img.shields.io/badge/status-v1.0.0-blue" />`{=html}
-```{=html}
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" />
+  <img src="https://img.shields.io/badge/dbt-compatible-orange.svg" />
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" />
+  <img src="https://img.shields.io/badge/status-v1.0.0-blue" />
 </p>
 ```
 > Compare **dbt model outputs at the data level** across Git branches.
