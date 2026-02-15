@@ -1,10 +1,9 @@
 [project]
 name = "dbt-model-diff"
-version = "0.1.0"
-description = "Data diff tool for dbt models (Postgres v1)"
+version = "0.5.0"
+description = "OSS tool to compare dbt model data between git refs (Postgres + Redshift)."
 readme = "README.md"
 requires-python = ">=3.10"
-
 dependencies = [
   "typer>=0.12.0",
   "rich>=13.0.0",
@@ -13,4 +12,4 @@ dependencies = [
 ]
 
 [project.scripts]
-dbt-model-diff = "dbt_model_diff.cli:app"
+dbt-model-diff = "dbt_model_diff.cli:main"
