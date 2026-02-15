@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Tuple
 
 import psycopg2
 import typer
@@ -20,10 +20,10 @@ from rich.table import Table
 app = typer.Typer(add_completion=False)
 console = Console()
 
-
-# ----------------------------
+# ---------------------------------------------------------------------
 # helpers
-# ----------------------------
+# ---------------------------------------------------------------------
+
 
 def run(cmd: list[str], cwd: Path | None = None) -> str:
     p = subprocess.run(
@@ -58,6 +58,10 @@ def git_worktree_remove(repo_root: Path, dest: Path) -> None:
         pass
 
 
+# ---------------------------------------------------------------------
+# dbt + postgres helpers
+# ---------------------------------------------------------------------
+
 @dataclass
 class PgTarget:
     host: str
@@ -70,7 +74,7 @@ class PgTarget:
 def load_pg_target(profiles_dir: Path, profile: str | None, target: str | None) -> PgTarget:
     profiles_path = profiles_dir / "profiles.yml"
     if not profiles_path.exists():
-        raise FileNotFoundError(f"profiles.yml not found at: {profiles_path}")
+        raise FileNotFoundError(f"profiles.yml not found at {profiles_path}")
 
     data = yaml.safe_load(profiles_path.read_text())
 
@@ -84,14 +88,9 @@ def load_pg_target(profiles_dir: Path, profile: str | None, target: str | None) 
 
     prof = data[profile]
     outputs = prof.get("outputs", {})
-    if not outputs:
-        raise ValueError(f"No outputs found for profile '{profile}'.")
 
     if not target:
         target = prof.get("target")
-    if not target:
-        raise ValueError(
-            f"No target specified and profile '{profile}' has no default target.")
 
     out = outputs.get(target)
     if not out:
@@ -121,17 +120,15 @@ def pg_connect(t: PgTarget):
     )
 
 
-def dbt_build(project_dir: Path, profiles_dir: Path, model: str, forced_schema: str, target: str | None) -> None:
+def dbt_build(project_dir: Path, profiles_dir: Path, model: str, target: str | None):
     if not (project_dir / "dbt_project.yml").exists():
-        raise RuntimeError(
-            f"dbt_project.yml not found in project_dir: {project_dir}")
+        raise RuntimeError(f"dbt_project.yml not found in {project_dir}")
 
     cmd = [
         "dbt", "build",
         "--project-dir", str(project_dir),
         "--profiles-dir", str(profiles_dir),
         "--select", model,
-        "--vars", json.dumps({"dbt_diff_schema": forced_schema}),
     ]
     if target:
         cmd += ["--target", target]
@@ -139,20 +136,34 @@ def dbt_build(project_dir: Path, profiles_dir: Path, model: str, forced_schema: 
     run(cmd, cwd=project_dir)
 
 
-def get_relation_identifier_from_manifest(project_dir: Path, model: str) -> str:
+def get_model_node_from_manifest(project_dir: Path, model: str) -> dict:
     manifest_path = project_dir / "target" / "manifest.json"
     if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"manifest.json not found at {manifest_path}. "
-            f"dbt should generate it during build; check logs."
-        )
+        raise FileNotFoundError(f"manifest.json not found at {manifest_path}")
 
     manifest = json.loads(manifest_path.read_text())
     for node in manifest.get("nodes", {}).values():
         if node.get("resource_type") == "model" and node.get("name") == model:
-            return node.get("alias") or node.get("name")
-
+            return node
     raise ValueError(f"Model '{model}' not found in manifest.json")
+
+
+def parse_relation_name_pg(relation_name: str) -> Tuple[str, str]:
+    """
+    Parse dbt manifest relation_name like:
+      "db"."schema"."identifier"  OR  "schema"."identifier"
+    Return (schema, identifier).
+    """
+    quoted = re.findall(r'"([^"]+)"', relation_name or "")
+    if len(quoted) >= 2:
+        return quoted[-2], quoted[-1]
+
+    parts = [p.strip().strip('"')
+             for p in (relation_name or "").split(".") if p.strip()]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+
+    raise ValueError(f"Could not parse relation_name: {relation_name}")
 
 
 def list_columns(conn, schema: str, table: str) -> list[str]:
@@ -168,7 +179,6 @@ def list_columns(conn, schema: str, table: str) -> list[str]:
 
 
 def build_row_hash_expr(cols: Iterable[str]) -> str:
-    # md5(coalesce(col::text,'<NULL>') || '|' || ...)
     parts = [f"coalesce({quote_ident(c)}::text,'<NULL>')" for c in cols]
     if not parts:
         return "md5('')"
@@ -189,9 +199,29 @@ def run_rows(conn, sql: str) -> list[tuple]:
         return cur.fetchall()
 
 
-# ----------------------------
+def ensure_schema(conn, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"create schema if not exists {quote_ident(schema)};")
+
+
+def drop_schema(conn, schema: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"drop schema if exists {quote_ident(schema)} cascade;")
+
+
+def ctas_copy(conn, src_schema: str, src_ident: str, dst_schema: str, dst_ident: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"drop table if exists {quote_ident(dst_schema)}.{quote_ident(dst_ident)};")
+        cur.execute(
+            f"create table {quote_ident(dst_schema)}.{quote_ident(dst_ident)} as "
+            f"select * from {quote_ident(src_schema)}.{quote_ident(src_ident)};"
+        )
+
+
+# ---------------------------------------------------------------------
 # CLI (MODEL-first)
-# ----------------------------
+# ---------------------------------------------------------------------
 
 @app.command()
 def main(
@@ -203,8 +233,8 @@ def main(
     head: str = typer.Option("HEAD", help="Head git ref/branch"),
     project_dir: Path = typer.Option(
         Path("."), help="Path to dbt project (folder containing dbt_project.yml)"),
-    profiles_dir: Path = typer.Option(Path(
-        "~/.dbt").expanduser(), help="Path to dbt profiles dir (folder containing profiles.yml)"),
+    profiles_dir: Path = typer.Option(
+        Path("."), help="Path to dbt profiles dir (folder containing profiles.yml)"),
     profile: str | None = typer.Option(
         None, help="dbt profile name (optional)"),
     target: str | None = typer.Option(None, help="dbt target name (optional)"),
@@ -212,16 +242,12 @@ def main(
         None, help="Optional SQL predicate applied to both sides"),
     sample: int = typer.Option(20, help="Sample changed keys to print"),
     keep_schemas: bool = typer.Option(
-        False, help="Do not drop diff schemas after run"),
-    debug_paths: bool = typer.Option(
-        True, help="Print repo/project/profile paths for debugging"),
+        False, help="Do not drop diff schema after run"),
 ):
-    # parse keys
     kcols = [k.strip() for k in keys.split(",") if k.strip()]
     if not kcols:
-        raise typer.BadParameter("Provide at least one key column via --keys")
+        raise typer.BadParameter("Provide at least one key via --keys")
 
-    # normalize paths
     project_dir = project_dir.expanduser().resolve()
     profiles_dir = profiles_dir.expanduser().resolve()
 
@@ -229,44 +255,37 @@ def main(
         raise RuntimeError(
             f"--project-dir must contain dbt_project.yml. Not found in: {project_dir}")
 
-    # repo root (worktrees created here)
-    repo_root = Path(
-        run(["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"]).strip()
-    ).resolve()
-
-    # dbt project path relative to repo root (used inside worktrees)
-    try:
-        project_rel = project_dir.relative_to(repo_root)
-    except ValueError:
-        raise RuntimeError(
-            f"--project-dir must be inside the git repo.\nrepo_root={repo_root}\nproject_dir={project_dir}"
-        )
+    repo_root = Path(run(["git", "-C", str(project_dir),
+                     "rev-parse", "--show-toplevel"]).strip()).resolve()
+    project_rel = project_dir.relative_to(repo_root)
 
     run_id = sanitize_ident(f"{model}_{base}_{head}")
-    base_schema = f"dbt_diff__base__{run_id}"
-    head_schema = f"dbt_diff__head__{run_id}"
+    diff_schema = f"dbt_model_diff__{run_id}"
+    base_table = f"{sanitize_ident(model)}__base"
+    head_table = f"{sanitize_ident(model)}__head"
 
     console.print(
         Panel.fit(
             f"[bold]{model}[/bold]\n"
             f"base={base}  head={head}\n"
             f"keys={', '.join(kcols)}\n"
-            f"schemas:\n  {base_schema}\n  {head_schema}",
-            title="dbt-model-diff (data) — Postgres v1",
+            f"diff_schema={diff_schema}\n"
+            f"tables:\n  {base_table}\n  {head_table}",
+            title="dbt-model-diff (data) — Postgres v1 (Option 2, fixed)",
         )
     )
-
-    if debug_paths:
-        console.print(f"[dim]repo_root    = {repo_root}[/dim]")
-        console.print(f"[dim]project_dir  = {project_dir}[/dim]")
-        console.print(f"[dim]project_rel  = {project_rel}[/dim]")
-        console.print(f"[dim]profiles_dir = {profiles_dir}[/dim]")
 
     tmp = Path(tempfile.mkdtemp(prefix="dbt-model-diff-"))
     wt_base = tmp / "base"
     wt_head = tmp / "head"
 
+    pg = load_pg_target(profiles_dir, profile, target)
+    conn = pg_connect(pg)
+    conn.autocommit = True
+
     try:
+        ensure_schema(conn, diff_schema)
+
         # create worktrees
         git_worktree_add(repo_root, base, wt_base)
         git_worktree_add(repo_root, head, wt_head)
@@ -274,73 +293,133 @@ def main(
         wt_base_project = wt_base / project_rel
         wt_head_project = wt_head / project_rel
 
-        # dbt builds (must run from the dbt project folder)
-        console.print(f"[cyan]dbt build (base) → {base_schema}[/cyan]")
-        dbt_build(wt_base_project, profiles_dir, model, base_schema, target)
+        # -------------------------
+        # BASE: build then copy NOW
+        # -------------------------
+        console.print(f"[cyan]dbt build (base: {base})[/cyan]")
+        dbt_build(wt_base_project, profiles_dir, model, target)
 
-        console.print(f"[cyan]dbt build (head) → {head_schema}[/cyan]")
-        dbt_build(wt_head_project, profiles_dir, model, head_schema, target)
+        base_node = get_model_node_from_manifest(wt_base_project, model)
+        base_relname = base_node.get("relation_name")
+        console.print(f"[dim]base relation_name: {base_relname}[/dim]")
 
-        # relation identifier from manifest
-        identifier = get_relation_identifier_from_manifest(
-            wt_head_project, model)
+        base_src_schema, base_src_ident = parse_relation_name_pg(base_relname)
+        console.print(
+            f"[cyan]Copying base relation → {diff_schema}.{base_table}[/cyan]")
+        ctas_copy(conn, base_src_schema, base_src_ident,
+                  diff_schema, base_table)
 
-        # connect to postgres using dbt profile creds
-        pg = load_pg_target(profiles_dir, profile, target)
-        conn = pg_connect(pg)
-        conn.autocommit = True
+        # -------------------------
+        # HEAD: build then copy NOW
+        # -------------------------
+        console.print(f"[cyan]dbt build (head: {head})[/cyan]")
+        dbt_build(wt_head_project, profiles_dir, model, target)
 
-        try:
-            base_rel = f"{quote_ident(base_schema)}.{quote_ident(identifier)}"
-            head_rel = f"{quote_ident(head_schema)}.{quote_ident(identifier)}"
+        head_node = get_model_node_from_manifest(wt_head_project, model)
+        head_relname = head_node.get("relation_name")
+        console.print(f"[dim]head relation_name: {head_relname}[/dim]")
 
-            predicate = f" where {where} " if where else ""
-            base_sub = f"(select * from {base_rel}{predicate})"
-            head_sub = f"(select * from {head_rel}{predicate})"
+        head_src_schema, head_src_ident = parse_relation_name_pg(head_relname)
+        console.print(
+            f"[cyan]Copying head relation → {diff_schema}.{head_table}[/cyan]")
+        ctas_copy(conn, head_src_schema, head_src_ident,
+                  diff_schema, head_table)
 
-            # columns
-            head_cols = list_columns(conn, head_schema, identifier)
-            base_cols_set = set(list_columns(conn, base_schema, identifier))
-            common_cols = [c for c in head_cols if c in base_cols_set]
-            missing_in_base = [c for c in head_cols if c not in base_cols_set]
+        # -------------------------
+        # DIFF the controlled tables
+        # -------------------------
+        base_rel = f"{quote_ident(diff_schema)}.{quote_ident(base_table)}"
+        head_rel = f"{quote_ident(diff_schema)}.{quote_ident(head_table)}"
 
-            non_key_cols = [c for c in common_cols if c not in set(kcols)]
+        predicate = f" where {where} " if where else ""
+        base_sub = f"(select * from {base_rel}{predicate})"
+        head_sub = f"(select * from {head_rel}{predicate})"
 
-            # rowcounts
-            base_count = run_scalar(conn, f"select count(*) from {base_sub} b")
-            head_count = run_scalar(conn, f"select count(*) from {head_sub} h")
+        # columns
+        head_cols = list_columns(conn, diff_schema, head_table)
+        base_cols = list_columns(conn, diff_schema, base_table)
+        head_set, base_set = set(head_cols), set(base_cols)
 
-            # added/removed
-            join_on = " and ".join(
-                [f"b.{quote_ident(k)} = h.{quote_ident(k)}" for k in kcols])
-            first_key = kcols[0]
+        common_cols = [c for c in head_cols if c in base_set]
+        only_in_head = [c for c in head_cols if c not in base_set]
+        only_in_base = [c for c in base_cols if c not in head_set]
 
-            added = run_scalar(
-                conn,
-                f"""
-                select count(*)
-                from {head_sub} h
-                left join {base_sub} b on {join_on}
-                where b.{quote_ident(first_key)} is null
-                """,
+        non_key_cols = [c for c in common_cols if c not in set(kcols)]
+
+        # rowcounts
+        base_count = run_scalar(conn, f"select count(*) from {base_sub} b")
+        head_count = run_scalar(conn, f"select count(*) from {head_sub} h")
+
+        # added/removed
+        join_on = " and ".join(
+            [f"b.{quote_ident(k)} = h.{quote_ident(k)}" for k in kcols])
+        first_key = kcols[0]
+
+        added = run_scalar(
+            conn,
+            f"""
+            select count(*)
+            from {head_sub} h
+            left join {base_sub} b on {join_on}
+            where b.{quote_ident(first_key)} is null
+            """,
+        )
+
+        removed = run_scalar(
+            conn,
+            f"""
+            select count(*)
+            from {base_sub} b
+            left join {head_sub} h on {join_on}
+            where h.{quote_ident(first_key)} is null
+            """,
+        )
+
+        # changed via hash (common non-key cols only)
+        base_hash = build_row_hash_expr(non_key_cols)
+        head_hash = build_row_hash_expr(non_key_cols)
+        using_clause = ", ".join([quote_ident(k) for k in kcols])
+
+        changed = run_scalar(
+            conn,
+            f"""
+            with base_h as (
+              select {", ".join([quote_ident(k) for k in kcols])},
+                     {base_hash} as row_hash
+              from {base_sub} b
+            ),
+            head_h as (
+              select {", ".join([quote_ident(k) for k in kcols])},
+                     {head_hash} as row_hash
+              from {head_sub} h
             )
+            select count(*)
+            from base_h b
+            join head_h h using ({using_clause})
+            where b.row_hash <> h.row_hash
+            """,
+        )
 
-            removed = run_scalar(
-                conn,
-                f"""
-                select count(*)
-                from {base_sub} b
-                left join {head_sub} h on {join_on}
-                where h.{quote_ident(first_key)} is null
-                """,
-            )
+        tbl = Table(title="Summary")
+        tbl.add_column("Metric")
+        tbl.add_column("Value", justify="right")
+        tbl.add_row("Base rowcount", str(base_count))
+        tbl.add_row("Head rowcount", str(head_count))
+        tbl.add_row("Added rows", str(added))
+        tbl.add_row("Removed rows", str(removed))
+        tbl.add_row("Changed rows", str(changed))
+        console.print(tbl)
 
-            # changed via hash
-            base_hash = build_row_hash_expr(non_key_cols)
-            head_hash = build_row_hash_expr(non_key_cols)
-            using_clause = ", ".join([quote_ident(k) for k in kcols])
+        if only_in_head:
+            console.print(
+                "[yellow]Columns only in HEAD:[/yellow] " + ", ".join(only_in_head))
+        if only_in_base:
+            console.print(
+                "[yellow]Columns only in BASE:[/yellow] " + ", ".join(only_in_base))
 
-            changed = run_scalar(
+        # sample changed keys
+        if changed and sample > 0:
+            rows = run_rows(
                 conn,
                 f"""
                 with base_h as (
@@ -353,79 +432,37 @@ def main(
                          {head_hash} as row_hash
                   from {head_sub} h
                 )
-                select count(*)
+                select {", ".join([f"b.{quote_ident(k)}" for k in kcols])}
                 from base_h b
                 join head_h h using ({using_clause})
                 where b.row_hash <> h.row_hash
+                limit {int(sample)}
                 """,
             )
 
-            # summary output
-            tbl = Table(title="Summary")
-            tbl.add_column("Metric")
-            tbl.add_column("Value", justify="right")
-            tbl.add_row("Base rowcount", str(base_count))
-            tbl.add_row("Head rowcount", str(head_count))
-            tbl.add_row("Added rows", str(added))
-            tbl.add_row("Removed rows", str(removed))
-            tbl.add_row("Changed rows", str(changed))
-            console.print(tbl)
-
-            if missing_in_base:
-                console.print(
-                    "[yellow]Columns present in head only (excluded from hash diff):[/yellow]")
-                console.print("  " + ", ".join(missing_in_base))
-
-            # sample changed keys
-            if changed and sample > 0:
-                rows = run_rows(
-                    conn,
-                    f"""
-                    with base_h as (
-                      select {", ".join([quote_ident(k) for k in kcols])},
-                             {base_hash} as row_hash
-                      from {base_sub} b
-                    ),
-                    head_h as (
-                      select {", ".join([quote_ident(k) for k in kcols])},
-                             {head_hash} as row_hash
-                      from {head_sub} h
-                    )
-                    select {", ".join([f"b.{quote_ident(k)}" for k in kcols])}
-                    from base_h b
-                    join head_h h using ({using_clause})
-                    where b.row_hash <> h.row_hash
-                    limit {int(sample)}
-                    """,
-                )
-
-                samp = Table(title=f"Sample changed keys (limit {sample})")
-                for k in kcols:
-                    samp.add_column(k)
-                for r in rows:
-                    samp.add_row(*[str(x) for x in r])
-                console.print(samp)
-
-        finally:
-            conn.close()
-
-        # cleanup schemas
-        if not keep_schemas:
-            conn = pg_connect(pg)
-            conn.autocommit = True
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"drop schema if exists {quote_ident(base_schema)} cascade;")
-                    cur.execute(
-                        f"drop schema if exists {quote_ident(head_schema)} cascade;")
-            finally:
-                conn.close()
+            samp = Table(title=f"Sample changed keys (limit {sample})")
+            for k in kcols:
+                samp.add_column(k)
+            for r in rows:
+                samp.add_row(*[str(x) for x in r])
+            console.print(samp)
 
     finally:
-        git_worktree_remove(repo_root, wt_base)
-        git_worktree_remove(repo_root, wt_head)
-        shutil.rmtree(tmp, ignore_errors=True)
+        # cleanup worktrees
+        try:
+            git_worktree_remove(repo_root, wt_base)
+            git_worktree_remove(repo_root, wt_head)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # cleanup diff schema
+        if not keep_schemas:
+            try:
+                drop_schema(conn, diff_schema)
+            except Exception:
+                pass
+
+        conn.close()
 
 
 if __name__ == "__main__":
