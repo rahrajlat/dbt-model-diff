@@ -1,5 +1,15 @@
 # dbt-model-diff
 
+```{=html}
+<p align="center">
+```
+`<img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" />`{=html}
+`<img src="https://img.shields.io/badge/dbt-compatible-orange.svg" />`{=html}
+`<img src="https://img.shields.io/badge/license-MIT-green.svg" />`{=html}
+`<img src="https://img.shields.io/badge/status-v1.0.0-blue" />`{=html}
+```{=html}
+</p>
+```
 > Compare **dbt model outputs at the data level** across Git branches.
 
 `dbt-model-diff` is an open-source CLI tool that compares the actual
@@ -38,16 +48,16 @@ This enables:
 
 ## ✨ Key Features
 
--   ✅ Git worktree isolation (no macro overrides required)
--   ✅ Data-level comparison between branches
--   ✅ Key-based row diff
--   ✅ Schema difference detection (added/removed columns)
--   ✅ Column profiling (% nulls, uniqueness ratio)
--   ✅ JSON output for CI pipelines
--   ✅ Markdown output for PR comments
--   ✅ Rich CLI output for local debugging
--   ✅ Docker-based integration test
--   ✅ Postgres + Redshift support (v1)
+-   Git worktree isolation (no macro overrides required)
+-   Data-level comparison between branches
+-   Key-based row diff
+-   Schema difference detection (added/removed columns)
+-   Column profiling (% nulls, uniqueness ratio)
+-   JSON output for CI pipelines
+-   Markdown output for PR comments
+-   Rich CLI output for local debugging
+-   Docker-based integration test
+-   Postgres + Redshift support (v1)
 
 ------------------------------------------------------------------------
 
@@ -65,6 +75,40 @@ This enables:
 6.  Outputs results in the selected format (`rich`, `json`, `markdown`)
 
 No changes to your dbt project are required.
+
+------------------------------------------------------------------------
+
+## 🏗 Architecture Overview
+
+                    ┌──────────────────────┐
+                    │   Git Worktrees      │
+                    │ (base / head refs)   │
+                    └─────────┬────────────┘
+                              │
+                    ┌─────────▼────────────┐
+                    │   dbt build (x2)     │
+                    └─────────┬────────────┘
+                              │
+                    ┌─────────▼────────────┐
+                    │ Manifest Resolution  │
+                    └─────────┬────────────┘
+                              │
+                    ┌─────────▼────────────┐
+                    │ Snapshot to Diff     │
+                    │ Schema (CTAS)        │
+                    └─────────┬────────────┘
+                              │
+                    ┌─────────▼────────────┐
+                    │ Data Comparison      │
+                    │ Row + Schema + Stats │
+                    └─────────┬────────────┘
+                              │
+                    ┌─────────▼────────────┐
+                    │ Output Formatter     │
+                    │ (rich/json/md)       │
+                    └──────────────────────┘
+
+Modular design enables easy extension to additional warehouses.
 
 ------------------------------------------------------------------------
 
@@ -116,6 +160,27 @@ dbt-model-diff diff dim_customers   --keys customer_id   --base main   --head fe
 
 ------------------------------------------------------------------------
 
+## 🎥 Demo (CLI Walkthrough)
+
+You can record a short demo using:
+
+``` bash
+asciinema rec demo.cast
+dbt-model-diff diff dim_customers --keys customer_id ...
+exit
+```
+
+Then embed in README:
+
+``` html
+<script src="https://asciinema.org/a/your-demo-id.js" async></script>
+```
+
+A short 30-second demo significantly improves discoverability and
+credibility.
+
+------------------------------------------------------------------------
+
 ## 🐳 End-to-End Integration Test
 
 The project includes a full Docker-based integration test that:
@@ -133,18 +198,42 @@ make e2e-test
 
 ------------------------------------------------------------------------
 
-## 🏗 Architecture
+## 🧪 Testing
 
-The project is structured with clear separation of concerns:
+Run all tests:
 
--   `cli/` -- Command-line interface
--   `core/` -- Diff orchestration logic
--   `adapters/` -- Warehouse-specific implementations
--   `formatters/` -- Output rendering
--   `tests/` -- Unit and integration tests
+``` bash
+pytest
+```
 
-The adapter abstraction layer enables future support for additional
-warehouses (e.g., Snowflake).
+Run integration only:
+
+``` bash
+make e2e-test
+```
+
+------------------------------------------------------------------------
+
+## 📦 Publishing to PyPI
+
+Build distribution:
+
+``` bash
+python -m build
+```
+
+Upload (after configuring API token):
+
+``` bash
+twine upload dist/*
+```
+
+Tag release:
+
+``` bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 
 ------------------------------------------------------------------------
 
