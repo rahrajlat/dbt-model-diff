@@ -372,6 +372,22 @@ Your support helps improve and expand the project.
 
 ---
 
+## Future Ideas
+
+Planned improvements and enhancements:
+
+- GitHub Actions integration
+- Automatic PR comment generation in CI
+- `--fail-on-diff` flag for CI enforcement
+- More comparison metrics (distribution shifts, aggregates, thresholds)
+- Improved performance for large tables
+- Snowflake and BigQuery support
+- HTML diff report export
+- Better logging and debug mode
+
+The goal is to make `dbt-model-diff` a lightweight, reliable data regression tool for modern analytics workflows.
+
+---
 ## About the Author
 
 Built with ❤️ by **Rahul Rajasekharan**  
