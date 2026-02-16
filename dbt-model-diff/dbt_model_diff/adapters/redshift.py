@@ -66,7 +66,7 @@ class RedshiftAdapter:
         sql = """
             select column_name
             from svv_columns
-            where table_schema = %s and table_name = %s
+            where table_schema = %s and table_name = %s and data_type !='boolean'
             order by ordinal_position
         """
         with conn.cursor() as cur:
